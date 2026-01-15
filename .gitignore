@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Source Data (Keep .toon files, ignore raw scraping artifacts if any)
+tafsirs_json/
+
+# Databases
+# We include individual DBs (small), but exclude the Master DB (1.5GB)
+tafsirs/db/master.db
+
+# Ignore the directories inside tafsirs/ (the split text folders from previous repo)
+# We only want tafsirs/*.toon and tafsirs/db/*.db
+tafsirs/*/
+!tafsirs/db/
