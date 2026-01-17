@@ -3,17 +3,29 @@
 Quran Toon to SQLite Comprehensive Converter
 
 Converts all toon files to SQLite databases optimized for HTTP Range Requests.
-This enables SQL-over-HTTP using libraries like wa-sqlite with HTTP VFS.
+All output files are kept under 100MB for regular GitHub hosting.
 
-Data Types:
-1. quran.db - Core Quran text with surah/ayah structure
-2. editions.db - All 294+ translations in one DB with per-edition tables
-3. tajweed.db - Tajweed rules per ayah (character position-based)
-4. tajweed_glyphs.db - QPC v4 font glyph codes per page/verse
-5. mutashabihat.db - Similar verses cross-references
-6. recitations.db - Reciter metadata
-7. info.db - Surah metadata (names, revelation, juz, pages, etc.)
-8. tafsirs/db/*.db - Already converted (127 files)
+Output Structure:
+=================
+/db/
+  quran.db          - Uthmani text (1.6 MB)
+  info.db           - Surah metadata (0.3 MB)
+  tajweed.db        - Tajweed rules (3.4 MB)
+  tajweed_glyphs.db - QPC v4 glyph codes (0.7 MB)
+  mutashabihat.db   - Similar verses (0.1 MB)
+  recitations.db    - Reciter metadata (0.01 MB)
+
+/db/editions/
+  index.db          - Edition metadata + chunk mapping (~0.1 MB)
+  chunk_1.db        - Editions 1-60 translations (~95 MB)
+  chunk_2.db        - Editions 61-120 translations (~95 MB)
+  chunk_3.db        - Editions 121-180 translations (~95 MB)
+  chunk_4.db        - Editions 181-240 translations (~95 MB)
+  chunk_5.db        - Editions 241-294 translations (~95 MB)
+
+/tafsirs/db/
+  index.db          - Tafsir metadata (replaces master.db)
+  {slug}.db         - Individual tafsir DBs (127 files, each <100MB)
 
 HTTP Optimization:
 - PRAGMA page_size = 4096 (optimal for Range Requests)
@@ -32,9 +44,16 @@ from datetime import datetime
 TOON_REPO = Path("/home/saboor/code/quran-api-toon")
 SQL_REPO = Path("/home/saboor/code/quran-api-sql")
 DB_DIR = SQL_REPO / "db"
+EDITIONS_DIR = DB_DIR / "editions"
+TAFSIRS_DB_DIR = SQL_REPO / "tafsirs" / "db"
+
+# Chunk size for editions (aim for ~45 editions per chunk to stay under 100MB)
+EDITIONS_PER_CHUNK = 45
 
 # Ensure output directories exist
 DB_DIR.mkdir(parents=True, exist_ok=True)
+EDITIONS_DIR.mkdir(parents=True, exist_ok=True)
+TAFSIRS_DB_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Utility Functions ---
 
@@ -57,6 +76,7 @@ def finalize_db(conn, path):
     conn.close()
     size_mb = path.stat().st_size / (1024 * 1024)
     print(f"  Created {path.name} ({size_mb:.2f} MB)")
+    return size_mb
 
 # --- Quran.toon Parser ---
 
@@ -71,13 +91,11 @@ def parse_quran_toon():
             if not line or line.startswith('quran['):
                 continue
 
-            # Format: "  1,1,text" or "  1,2,\"text\""
             match = re.match(r'\s*(\d+),(\d+),(.+)$', line)
             if match:
                 surah = int(match.group(1))
                 ayah = int(match.group(2))
                 text = match.group(3).strip()
-                # Remove surrounding quotes if present
                 if text.startswith('"') and text.endswith('"'):
                     text = text[1:-1]
                 elif text.startswith('" ') and text.endswith('"'):
@@ -130,14 +148,13 @@ def parse_info_toon():
             line = line.rstrip()
 
             if line.strip().startswith('- chapter:'):
-                # Save previous surah
                 if current_surah:
                     current_surah['verses'] = verses
                     surahs.append(current_surah)
                 current_surah = {'chapter': int(line.split(':')[1].strip())}
                 verses = []
                 in_verses = False
-            elif line.strip().startswith('name:') and 'current_surah' in dir():
+            elif line.strip().startswith('name:') and current_surah:
                 current_surah['name'] = line.split(':', 1)[1].strip()
             elif line.strip().startswith('englishname:'):
                 current_surah['englishname'] = line.split(':', 1)[1].strip()
@@ -148,7 +165,6 @@ def parse_info_toon():
             elif line.strip().startswith('verses['):
                 in_verses = True
             elif in_verses and re.match(r'\s+\d+,', line):
-                # verse,line,juz,manzil,page,ruku,maqra,sajda
                 parts = line.strip().split(',')
                 if len(parts) >= 8:
                     verses.append({
@@ -162,7 +178,6 @@ def parse_info_toon():
                         'sajda': parts[7].lower() == 'true'
                     })
 
-        # Don't forget last surah
         if current_surah:
             current_surah['verses'] = verses
             surahs.append(current_surah)
@@ -225,7 +240,7 @@ def create_info_db():
     conn.execute("COMMIT")
     finalize_db(conn, db_path)
 
-# --- Editions Parser ---
+# --- Editions Parser (Chunked) ---
 
 def parse_editions_toon():
     """Parse editions.toon for edition metadata."""
@@ -238,7 +253,6 @@ def parse_editions_toon():
             if not line or line.startswith('meta:') or line.startswith('editions['):
                 continue
 
-            # Parse CSV-like: id,author,lang,dir,src,note
             parts = []
             current = ""
             in_quotes = False
@@ -285,83 +299,90 @@ def parse_edition_toon_file(path):
 
     return ayahs
 
-def create_editions_db():
-    """Create editions.db with all translations."""
-    print("\n=== Creating editions.db ===")
+def create_editions_chunked():
+    """Create chunked edition databases (each under 100MB)."""
+    print("\n=== Creating Editions (Chunked) ===")
 
-    schema = """
+    editions = parse_editions_toon()
+    print(f"  Found {len(editions)} editions in metadata")
+
+    # Calculate chunks
+    num_chunks = (len(editions) + EDITIONS_PER_CHUNK - 1) // EDITIONS_PER_CHUNK
+    print(f"  Splitting into {num_chunks} chunks (~{EDITIONS_PER_CHUNK} editions each)")
+
+    # --- Create Index DB ---
+    index_schema = """
     CREATE TABLE editions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id INTEGER PRIMARY KEY,
         slug TEXT UNIQUE,
         author TEXT,
         language TEXT,
         direction TEXT,
         source TEXT,
-        note TEXT
+        note TEXT,
+        chunk_id INTEGER
     );
+    CREATE INDEX idx_editions_lang ON editions(language);
+    CREATE INDEX idx_editions_chunk ON editions(chunk_id);
+    """
 
+    index_path = EDITIONS_DIR / "index.db"
+    index_conn = init_db(index_path, index_schema)
+
+    # --- Create Chunk DBs ---
+    chunk_schema = """
     CREATE TABLE translations (
         edition_id INTEGER,
         surah INTEGER,
         ayah INTEGER,
         text TEXT,
-        PRIMARY KEY (edition_id, surah, ayah),
-        FOREIGN KEY (edition_id) REFERENCES editions(id)
+        PRIMARY KEY (edition_id, surah, ayah)
     );
-
     CREATE INDEX idx_trans_edition ON translations(edition_id);
     CREATE INDEX idx_trans_surah ON translations(surah);
     """
 
-    db_path = DB_DIR / "editions.db"
-    conn = init_db(db_path, schema)
+    editions_dir_toon = TOON_REPO / "editions"
 
-    editions = parse_editions_toon()
-    print(f"  Found {len(editions)} editions in metadata")
+    # Process in chunks
+    for chunk_id in range(1, num_chunks + 1):
+        start_idx = (chunk_id - 1) * EDITIONS_PER_CHUNK
+        end_idx = min(chunk_id * EDITIONS_PER_CHUNK, len(editions))
+        chunk_editions = editions[start_idx:end_idx]
 
-    conn.execute("BEGIN TRANSACTION")
+        print(f"\n  Chunk {chunk_id}: editions {start_idx + 1} to {end_idx}")
 
-    # Insert edition metadata
-    for ed in editions:
-        conn.execute(
-            "INSERT INTO editions (slug, author, language, direction, source, note) VALUES (?, ?, ?, ?, ?, ?)",
-            (ed['id'], ed['author'], ed['language'], ed['direction'], ed['source'], ed['note'])
-        )
+        chunk_path = EDITIONS_DIR / f"chunk_{chunk_id}.db"
+        chunk_conn = init_db(chunk_path, chunk_schema)
 
-    conn.execute("COMMIT")
+        for i, ed in enumerate(chunk_editions):
+            edition_id = start_idx + i + 1  # 1-based global ID
 
-    # Process each edition's toon file
-    editions_dir = TOON_REPO / "editions"
-    processed = 0
-
-    for ed in editions:
-        toon_file = editions_dir / f"{ed['id']}.toon"
-        if not toon_file.exists():
-            continue
-
-        # Get edition_id
-        cursor = conn.execute("SELECT id FROM editions WHERE slug = ?", (ed['id'],))
-        row = cursor.fetchone()
-        if not row:
-            continue
-        edition_id = row[0]
-
-        ayahs = parse_edition_toon_file(toon_file)
-
-        if ayahs:
-            conn.execute("BEGIN TRANSACTION")
-            conn.executemany(
-                "INSERT INTO translations (edition_id, surah, ayah, text) VALUES (?, ?, ?, ?)",
-                [(edition_id, s, a, t) for s, a, t in ayahs]
+            # Add to index with chunk mapping
+            index_conn.execute(
+                "INSERT INTO editions (id, slug, author, language, direction, source, note, chunk_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (edition_id, ed['id'], ed['author'], ed['language'], ed['direction'], ed['source'], ed['note'], chunk_id)
             )
-            conn.execute("COMMIT")
 
-        processed += 1
-        if processed % 50 == 0:
-            print(f"  Processed {processed} editions...")
+            # Parse and add translations to chunk
+            toon_file = editions_dir_toon / f"{ed['id']}.toon"
+            if not toon_file.exists():
+                continue
 
-    print(f"  Total: {processed} editions processed")
-    finalize_db(conn, db_path)
+            ayahs = parse_edition_toon_file(toon_file)
+            if ayahs:
+                chunk_conn.execute("BEGIN TRANSACTION")
+                chunk_conn.executemany(
+                    "INSERT INTO translations (edition_id, surah, ayah, text) VALUES (?, ?, ?, ?)",
+                    [(edition_id, s, a, t) for s, a, t in ayahs]
+                )
+                chunk_conn.execute("COMMIT")
+
+        size = finalize_db(chunk_conn, chunk_path)
+        if size > 100:
+            print(f"  WARNING: Chunk {chunk_id} exceeds 100MB ({size:.2f} MB)")
+
+    finalize_db(index_conn, index_path)
 
 # --- Tajweed Parser ---
 
@@ -370,6 +391,7 @@ def parse_tajweed_toon():
     tajweed_file = TOON_REPO / "tajweed.toon"
     rules = []
     current_ayah = None
+    surah = 0
 
     with open(tajweed_file, 'r', encoding='utf-8') as f:
         for line in f:
@@ -383,7 +405,6 @@ def parse_tajweed_toon():
             elif line.strip().startswith('rules['):
                 continue
             elif current_ayah and re.match(r'\s+\d+,\d+,\w+', line):
-                # start,end,rule_type
                 parts = line.strip().split(',')
                 if len(parts) >= 3:
                     rules.append({
@@ -429,59 +450,6 @@ def create_tajweed_db():
 
     finalize_db(conn, db_path)
 
-# --- Mutashabihat Parser ---
-
-def parse_mutashabihat_toon():
-    """Parse mutashabihat/data.toon for similar verses."""
-    data_file = TOON_REPO / "mutashabihat" / "data.toon"
-    entries = []
-
-    with open(data_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('['):
-                continue
-
-            # Format: "id","source_ref","refs"
-            match = re.match(r'"(\d+)","([^"]+)","([^"]+)"', line)
-            if match:
-                entries.append({
-                    'id': int(match.group(1)),
-                    'source': match.group(2),
-                    'refs': match.group(3)
-                })
-
-    return entries
-
-def create_mutashabihat_db():
-    """Create mutashabihat.db with similar verse cross-references."""
-    print("\n=== Creating mutashabihat.db ===")
-
-    schema = """
-    CREATE TABLE similarities (
-        id INTEGER PRIMARY KEY,
-        source_ref TEXT,
-        similar_refs TEXT
-    );
-
-    CREATE INDEX idx_similar_source ON similarities(source_ref);
-    """
-
-    db_path = DB_DIR / "mutashabihat.db"
-    conn = init_db(db_path, schema)
-
-    entries = parse_mutashabihat_toon()
-    print(f"  Parsed {len(entries)} similarity entries")
-
-    conn.execute("BEGIN TRANSACTION")
-    conn.executemany(
-        "INSERT INTO similarities (id, source_ref, similar_refs) VALUES (?, ?, ?)",
-        [(e['id'], e['source'], e['refs']) for e in entries]
-    )
-    conn.execute("COMMIT")
-
-    finalize_db(conn, db_path)
-
 # --- Tajweed Glyphs Parser (QPC v4) ---
 
 def parse_tajweed_glyphs():
@@ -489,7 +457,6 @@ def parse_tajweed_glyphs():
     glyphs_dir = TOON_REPO / "quran" / "tajweed_glyphs"
     all_glyphs = []
 
-    # 604 pages in Mushaf
     for page_file in sorted(glyphs_dir.glob("*.toon")):
         try:
             page_num = int(page_file.stem)
@@ -502,7 +469,6 @@ def parse_tajweed_glyphs():
                 if not line or line.startswith('glyphs['):
                     continue
 
-                # Format: c,v,"glyph1|glyph2|..."
                 match = re.match(r'(\d+),(\d+),"(.+)"', line)
                 if match:
                     all_glyphs.append({
@@ -546,6 +512,58 @@ def create_tajweed_glyphs_db():
 
     finalize_db(conn, db_path)
 
+# --- Mutashabihat Parser ---
+
+def parse_mutashabihat_toon():
+    """Parse mutashabihat/data.toon for similar verses."""
+    data_file = TOON_REPO / "mutashabihat" / "data.toon"
+    entries = []
+
+    with open(data_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('['):
+                continue
+
+            match = re.match(r'"(\d+)","([^"]+)","([^"]+)"', line)
+            if match:
+                entries.append({
+                    'id': int(match.group(1)),
+                    'source': match.group(2),
+                    'refs': match.group(3)
+                })
+
+    return entries
+
+def create_mutashabihat_db():
+    """Create mutashabihat.db with similar verse cross-references."""
+    print("\n=== Creating mutashabihat.db ===")
+
+    schema = """
+    CREATE TABLE similarities (
+        id INTEGER PRIMARY KEY,
+        source_ref TEXT,
+        similar_refs TEXT
+    );
+
+    CREATE INDEX idx_similar_source ON similarities(source_ref);
+    """
+
+    db_path = DB_DIR / "mutashabihat.db"
+    conn = init_db(db_path, schema)
+
+    entries = parse_mutashabihat_toon()
+    print(f"  Parsed {len(entries)} similarity entries")
+
+    conn.execute("BEGIN TRANSACTION")
+    conn.executemany(
+        "INSERT INTO similarities (id, source_ref, similar_refs) VALUES (?, ?, ?)",
+        [(e['id'], e['source'], e['refs']) for e in entries]
+    )
+    conn.execute("COMMIT")
+
+    finalize_db(conn, db_path)
+
 # --- Recitations Parser ---
 
 def parse_recitations_toon():
@@ -559,7 +577,6 @@ def parse_recitations_toon():
             if not line or line.startswith('meta:') or line.startswith('reciters['):
                 continue
 
-            # Format: id,name,style,verses
             match = re.match(r'(\d+),([^,]+),([^,]*),(\d+)', line)
             if match:
                 reciters.append({
@@ -599,11 +616,93 @@ def create_recitations_db():
 
     finalize_db(conn, db_path)
 
+# --- Tafsirs Index ---
+
+def create_tafsirs_index():
+    """Create tafsirs/db/index.db with metadata for all tafsirs (replaces master.db)."""
+    print("\n=== Creating tafsirs/db/index.db ===")
+
+    schema = """
+    CREATE TABLE tafsirs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slug TEXT UNIQUE,
+        name TEXT,
+        author TEXT,
+        language TEXT,
+        source TEXT,
+        ayah_count INTEGER,
+        file_size_bytes INTEGER
+    );
+    CREATE INDEX idx_tafsirs_lang ON tafsirs(language);
+    """
+
+    index_path = TAFSIRS_DB_DIR / "index.db"
+    conn = init_db(index_path, schema)
+
+    # Scan existing tafsir DBs
+    tafsir_dbs = sorted(TAFSIRS_DB_DIR.glob("*.db"))
+    tafsir_dbs = [f for f in tafsir_dbs if f.name not in ('index.db', 'master.db')]
+
+    print(f"  Found {len(tafsir_dbs)} tafsir databases")
+
+    conn.execute("BEGIN TRANSACTION")
+
+    for db_file in tafsir_dbs:
+        slug = db_file.stem
+        file_size = db_file.stat().st_size
+
+        # Read metadata from the tafsir DB
+        try:
+            tafsir_conn = sqlite3.connect(str(db_file))
+            cursor = tafsir_conn.execute("SELECT COUNT(*) FROM ayahs")
+            ayah_count = cursor.fetchone()[0]
+
+            # Try to get metadata
+            try:
+                cursor = tafsir_conn.execute("SELECT value FROM metadata WHERE key = 'name'")
+                row = cursor.fetchone()
+                name = row[0] if row else slug
+            except:
+                name = slug
+
+            try:
+                cursor = tafsir_conn.execute("SELECT value FROM metadata WHERE key = 'author'")
+                row = cursor.fetchone()
+                author = row[0] if row else None
+            except:
+                author = None
+
+            try:
+                cursor = tafsir_conn.execute("SELECT value FROM metadata WHERE key = 'language'")
+                row = cursor.fetchone()
+                language = row[0] if row else None
+            except:
+                language = None
+
+            try:
+                cursor = tafsir_conn.execute("SELECT value FROM metadata WHERE key = 'source'")
+                row = cursor.fetchone()
+                source = row[0] if row else None
+            except:
+                source = None
+
+            tafsir_conn.close()
+
+            conn.execute(
+                "INSERT INTO tafsirs (slug, name, author, language, source, ayah_count, file_size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (slug, name, author, language, source, ayah_count, file_size)
+            )
+        except Exception as e:
+            print(f"    Warning: Could not read {slug}: {e}")
+
+    conn.execute("COMMIT")
+    finalize_db(conn, index_path)
+
 # --- Main ---
 
 def main():
     print("=" * 60)
-    print("Quran Toon to SQLite Converter")
+    print("Quran Toon to SQLite Converter (Sub-100MB Files)")
     print(f"Source: {TOON_REPO}")
     print(f"Output: {DB_DIR}")
     print("=" * 60)
@@ -613,11 +712,12 @@ def main():
     # Convert all data types
     create_quran_db()
     create_info_db()
-    create_editions_db()
+    create_editions_chunked()  # Chunked editions
     create_tajweed_db()
     create_tajweed_glyphs_db()
     create_mutashabihat_db()
     create_recitations_db()
+    create_tafsirs_index()  # Index instead of master.db
 
     # Summary
     elapsed = datetime.now() - start_time
@@ -627,13 +727,37 @@ def main():
     print("\nGenerated Databases:")
 
     total_size = 0
+    max_size = 0
+
+    # Core DBs
     for db_file in sorted(DB_DIR.glob("*.db")):
         size_mb = db_file.stat().st_size / (1024 * 1024)
         total_size += size_mb
+        max_size = max(max_size, size_mb)
         print(f"  {db_file.name}: {size_mb:.2f} MB")
 
-    print(f"\nTotal: {total_size:.2f} MB")
-    print("\nNote: Tafsirs are already converted in tafsirs/db/")
+    # Edition chunks
+    for db_file in sorted(EDITIONS_DIR.glob("*.db")):
+        size_mb = db_file.stat().st_size / (1024 * 1024)
+        total_size += size_mb
+        max_size = max(max_size, size_mb)
+        print(f"  editions/{db_file.name}: {size_mb:.2f} MB")
+
+    # Tafsirs index
+    index_file = TAFSIRS_DB_DIR / "index.db"
+    if index_file.exists():
+        size_mb = index_file.stat().st_size / (1024 * 1024)
+        total_size += size_mb
+        print(f"  tafsirs/db/index.db: {size_mb:.2f} MB")
+
+    print(f"\nTotal new DBs: {total_size:.2f} MB")
+    print(f"Max file size: {max_size:.2f} MB")
+
+    if max_size > 100:
+        print("\n⚠️  WARNING: Some files exceed 100MB!")
+    else:
+        print("\n✅ All files under 100MB - ready for GitHub!")
+
     print("=" * 60)
 
 if __name__ == "__main__":

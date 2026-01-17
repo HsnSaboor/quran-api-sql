@@ -7,24 +7,10 @@ __pycache__/
 tafsirs_json/
 
 # ======================================
-# Large Files (> 100MB) - Require LFS or CDN
-# ======================================
-# These files are too large for regular GitHub.
-# They should be hosted on a CDN (jsDelivr, Cloudflare R2, etc.)
-# and accessed via HTTP Range Requests using wa-sqlite.
-
-# Master tafsir DB (1.5GB combined tafsirs)
-tafsirs/db/master.db
-
-# Combined editions DB (475MB - all 294 translations)
-db/editions.db
-
-# ======================================
 # Source Toon Files (Replaced by SQLite DBs)
 # ======================================
 # The .toon files are the source format.
 # We now have optimized SQLite DBs instead.
-# Keeping .toon files in .gitignore to reduce repo size.
 tafsirs/*.toon
 *.toon
 !editions.toon
@@ -33,12 +19,3 @@ tafsirs/*.toon
 # Ignore subdirectories inside tafsirs/ (split text from old format)
 tafsirs/*/
 !tafsirs/db/
-
-# ======================================
-# Included Files (Small, < 100MB each)
-# ======================================
-# These are tracked in git:
-# - db/*.db (except editions.db) - small DBs
-# - tafsirs/db/*.db (except master.db) - per-tafsir DBs
-# - scripts/*.py - conversion scripts
-# - editions.toon, info.toon - metadata files

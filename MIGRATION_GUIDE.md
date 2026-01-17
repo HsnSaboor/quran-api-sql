@@ -4,11 +4,11 @@
 
 This repository provides SQLite databases optimized for **HTTP Range Requests**, enabling "SQL-over-HTTP" - clients can query databases without downloading the entire file.
 
-### Key Benefits
-- **Zero API Backend**: Databases served as static files from CDN
-- **Instant Queries**: HTTP Range Requests fetch only needed bytes (~4KB per query)
-- **Massive Compression**: 700,000+ files → ~10 databases
-- **Native Performance**: Direct SQLite on mobile apps
+### Key Design Principles
+- **All files under 100MB** - Compatible with regular GitHub (no LFS needed)
+- **Minimal file count** - Chunked editions vs 294 individual files
+- **Zero API Backend** - Databases served as static files from CDN
+- **Instant Queries** - HTTP Range Requests fetch only needed bytes (~4KB per query)
 
 ---
 
@@ -24,18 +24,34 @@ This repository provides SQLite databases optimized for **HTTP Range Requests**,
 | `tajweed_glyphs.db` | 0.7 MB | QPC v4 font glyph codes per page |
 | `mutashabihat.db` | 0.1 MB | Similar verses cross-references (814 entries) |
 | `recitations.db` | 0.01 MB | Reciter metadata (27 reciters) |
-| `editions.db`* | 475 MB | All 294 translations combined |
 
-*Large files require CDN hosting with Range Request support
+### Editions (Translations) - `/db/editions/`
+
+294 translations split into 7 chunks for GitHub compatibility:
+
+| Database | Size | Contents |
+|----------|------|----------|
+| `index.db` | 0.07 MB | Edition metadata + chunk mapping |
+| `chunk_1.db` | ~74 MB | Editions 1-45 |
+| `chunk_2.db` | ~55 MB | Editions 46-90 |
+| `chunk_3.db` | ~66 MB | Editions 91-135 |
+| `chunk_4.db` | ~98 MB | Editions 136-180 |
+| `chunk_5.db` | ~68 MB | Editions 181-225 |
+| `chunk_6.db` | ~75 MB | Editions 226-270 |
+| `chunk_7.db` | ~39 MB | Editions 271-294 |
+
+**Client Usage:**
+1. Query `index.db` to find edition metadata and `chunk_id`
+2. Query `chunk_{chunk_id}.db` for translations using `edition_id`
 
 ### Tafsir Databases (`/tafsirs/db/`)
 
-| Pattern | Count | Size Range | Description |
-|---------|-------|------------|-------------|
-| `{slug}.db` | 127 | 0.5-67 MB | Individual tafsir databases |
-| `master.db`* | 1 | 1.5 GB | All tafsirs combined (for global search) |
+| Database | Size | Description |
+|----------|------|-------------|
+| `index.db` | 0.04 MB | Tafsir metadata (replaces master.db) |
+| `{slug}.db` | 0.5-67 MB | 126 individual tafsir databases |
 
-*Large files require CDN hosting with Range Request support
+All tafsir files are under 100MB each.
 
 ---
 
@@ -76,7 +92,7 @@ CREATE TABLE verse_info (
 );
 ```
 
-### editions.db
+### editions/index.db
 ```sql
 CREATE TABLE editions (
     id INTEGER PRIMARY KEY,
@@ -85,9 +101,13 @@ CREATE TABLE editions (
     language TEXT,
     direction TEXT,  -- "ltr" or "rtl"
     source TEXT,
-    note TEXT
+    note TEXT,
+    chunk_id INTEGER  -- Which chunk file contains this edition
 );
+```
 
+### editions/chunk_N.db
+```sql
 CREATE TABLE translations (
     edition_id INTEGER,
     surah INTEGER,
@@ -128,14 +148,17 @@ CREATE TABLE glyphs (
 );
 ```
 
-The `glyph_text` contains pipe-separated (`|`) glyph codes where each segment = one word. Use with QPC v4 fonts.
-
-### mutashabihat.db
+### tafsirs/db/index.db
 ```sql
-CREATE TABLE similarities (
+CREATE TABLE tafsirs (
     id INTEGER PRIMARY KEY,
-    source_ref TEXT,     -- e.g., "2:23:15-17"
-    similar_refs TEXT    -- Semicolon-separated refs
+    slug TEXT UNIQUE,
+    name TEXT,
+    author TEXT,
+    language TEXT,
+    source TEXT,
+    ayah_count INTEGER,
+    file_size_bytes INTEGER
 );
 ```
 
@@ -158,6 +181,14 @@ CREATE TABLE ayahs (
 
 ## HTTP Range Request Implementation
 
+### How It Works
+
+1. SQLite engine requests "Page 42"
+2. VFS driver calculates byte offset: `42 × 4096`
+3. Browser sends: `Range: bytes=172032-176128`
+4. CDN returns just that 4KB chunk
+5. User gets instant query results
+
 ### Technology Stack
 
 **Web (Browser/PWA):**
@@ -168,45 +199,30 @@ CREATE TABLE ayahs (
 - [`op-sqlite`](https://github.com/OP-Engineering/op-sqlite) or `react-native-quick-sqlite`
 - Download databases to local storage, query natively
 
-### How It Works
-
-1. SQLite engine requests "Page 42"
-2. VFS driver calculates byte offset: `42 × 4096`
-3. Browser sends: `Range: bytes=172032-176128`
-4. CDN returns just that 4KB chunk
-5. User gets instant query results
-
-### CDN Setup
-
-Host databases on a CDN with CORS and Range Request support:
-
-```
-Base URL: https://cdn.example.com/quran-sql/
-         /db/quran.db
-         /db/info.db
-         /db/tajweed.db
-         /tafsirs/db/{slug}.db
-```
-
 ---
 
 ## Query Examples
 
 ### Get Surah Al-Fatiha
 ```sql
+-- From quran.db
 SELECT * FROM ayahs WHERE surah = 1;
 ```
 
-### Get English Translation
+### Get English Translation (Chunked Approach)
 ```sql
-SELECT t.text
-FROM translations t
-JOIN editions e ON t.edition_id = e.id
-WHERE e.slug = 'eng-sahih' AND t.surah = 2 AND t.ayah = 255;
+-- Step 1: Query index.db to find edition
+SELECT id, chunk_id FROM editions WHERE slug = 'eng-sahih';
+-- Returns: id=75, chunk_id=2
+
+-- Step 2: Query chunk_2.db
+SELECT text FROM translations
+WHERE edition_id = 75 AND surah = 2 AND ayah = 255;
 ```
 
 ### Get Tajweed Rules for an Ayah
 ```sql
+-- From tajweed.db
 SELECT start_pos, end_pos, rule_type
 FROM rules
 WHERE surah = 1 AND ayah = 1;
@@ -214,15 +230,26 @@ WHERE surah = 1 AND ayah = 1;
 
 ### Get Page 1 Glyph Codes
 ```sql
+-- From tajweed_glyphs.db
 SELECT * FROM glyphs WHERE page = 1;
 ```
 
 ### Get All Ayahs in Juz 30
 ```sql
-SELECT q.surah, q.ayah, q.text
-FROM ayahs q
-JOIN verse_info v ON q.surah = v.surah AND q.ayah = v.ayah
-WHERE v.juz = 30;
+-- Cross-database query (client-side join)
+-- 1. From info.db: get surah/ayah for juz 30
+SELECT surah, ayah FROM verse_info WHERE juz = 30;
+
+-- 2. From quran.db: get text for those ayahs
+SELECT text FROM ayahs WHERE surah = ? AND ayah = ?;
+```
+
+### List Available Tafsirs
+```sql
+-- From tafsirs/db/index.db
+SELECT slug, name, language, ayah_count
+FROM tafsirs
+ORDER BY language, name;
 ```
 
 ---
@@ -236,25 +263,19 @@ cd /path/to/quran-api-sql
 python3 scripts/convert_all_to_sql.py
 ```
 
-This creates all databases in `/db/` with HTTP-optimized settings:
+This creates all databases with HTTP-optimized settings:
 - `PRAGMA page_size = 4096`
 - `PRAGMA journal_mode = DELETE`
 - `VACUUM` for minimal size
 
 ---
 
-## File Size Reference
+## File Size Summary
 
-| Database | Regular Git | Requires |
-|----------|-------------|----------|
-| quran.db | ✅ | - |
-| info.db | ✅ | - |
-| tajweed.db | ✅ | - |
-| tajweed_glyphs.db | ✅ | - |
-| mutashabihat.db | ✅ | - |
-| recitations.db | ✅ | - |
-| editions.db | ❌ | LFS or CDN |
-| tafsirs/db/*.db | ✅* | - |
-| tafsirs/db/master.db | ❌ | LFS or CDN |
+| Category | Files | Total Size | Max File |
+|----------|-------|------------|----------|
+| Core DBs | 6 | ~6 MB | 3.4 MB |
+| Edition chunks | 8 | ~475 MB | 98 MB |
+| Tafsir DBs | 127 | ~1.3 GB | 67 MB |
 
-*Individual tafsir DBs are under 100MB each
+**All files under 100MB** ✅ - No Git LFS required!
