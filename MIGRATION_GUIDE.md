@@ -1,131 +1,260 @@
-# Quran App Migration & Architecture Guide
+# Quran SQL Database Architecture Guide
 
-## 1. Core Architecture Strategy: "SQLite-First"
+## Overview
 
-Instead of managing 700,000+ text files, the entire application will rely on **SQLite** databases served via CDN. This enables:
-1. **Instant Web Access:** Using HTTP Range Requests (fetching only the needed bytes).
-2. **Native Performance:** Direct file access on mobile.
-3. **Zero-API Backend:** The "API" is just the hosted SQLite file on jsDelivr.
+This repository provides SQLite databases optimized for **HTTP Range Requests**, enabling "SQL-over-HTTP" - clients can query databases without downloading the entire file.
+
+### Key Benefits
+- **Zero API Backend**: Databases served as static files from CDN
+- **Instant Queries**: HTTP Range Requests fetch only needed bytes (~4KB per query)
+- **Massive Compression**: 700,000+ files → ~10 databases
+- **Native Performance**: Direct SQLite on mobile apps
 
 ---
 
-## 2. Database Schema
+## Database Catalog
 
-### A. `quran.db` (Core Text & Metadata)
-Contains the Uthmani text, simple translations, and structural metadata. Small (~10MB), downloaded fully.
+### Core Databases (`/db/`)
 
+| Database | Size | Description |
+|----------|------|-------------|
+| `quran.db` | 1.6 MB | Uthmani Arabic text (6,236 ayahs) |
+| `info.db` | 0.3 MB | Surah metadata (names, juz, pages, manzil, ruku, maqra, sajda) |
+| `tajweed.db` | 3.4 MB | Tajweed rules (59,844 character position markers) |
+| `tajweed_glyphs.db` | 0.7 MB | QPC v4 font glyph codes per page |
+| `mutashabihat.db` | 0.1 MB | Similar verses cross-references (814 entries) |
+| `recitations.db` | 0.01 MB | Reciter metadata (27 reciters) |
+| `editions.db`* | 475 MB | All 294 translations combined |
+
+*Large files require CDN hosting with Range Request support
+
+### Tafsir Databases (`/tafsirs/db/`)
+
+| Pattern | Count | Size Range | Description |
+|---------|-------|------------|-------------|
+| `{slug}.db` | 127 | 0.5-67 MB | Individual tafsir databases |
+| `master.db`* | 1 | 1.5 GB | All tafsirs combined (for global search) |
+
+*Large files require CDN hosting with Range Request support
+
+---
+
+## Database Schemas
+
+### quran.db
+```sql
+CREATE TABLE ayahs (
+    surah INTEGER,
+    ayah INTEGER,
+    text TEXT,
+    PRIMARY KEY (surah, ayah)
+);
+```
+
+### info.db
 ```sql
 CREATE TABLE surahs (
-  id INTEGER PRIMARY KEY,
-  name_simple TEXT,
-  name_arabic TEXT,
-  verse_count INTEGER
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    english_name TEXT,
+    arabic_name TEXT,
+    revelation TEXT,  -- "Mecca" or "Madina"
+    verse_count INTEGER
+);
+
+CREATE TABLE verse_info (
+    surah INTEGER,
+    ayah INTEGER,
+    line INTEGER,
+    juz INTEGER,
+    manzil INTEGER,
+    page INTEGER,
+    ruku INTEGER,
+    maqra INTEGER,
+    sajda BOOLEAN,
+    PRIMARY KEY (surah, ayah)
+);
+```
+
+### editions.db
+```sql
+CREATE TABLE editions (
+    id INTEGER PRIMARY KEY,
+    slug TEXT UNIQUE,
+    author TEXT,
+    language TEXT,
+    direction TEXT,  -- "ltr" or "rtl"
+    source TEXT,
+    note TEXT
+);
+
+CREATE TABLE translations (
+    edition_id INTEGER,
+    surah INTEGER,
+    ayah INTEGER,
+    text TEXT,
+    PRIMARY KEY (edition_id, surah, ayah)
+);
+```
+
+### tajweed.db
+```sql
+CREATE TABLE rules (
+    id INTEGER PRIMARY KEY,
+    surah INTEGER,
+    ayah INTEGER,
+    start_pos INTEGER,  -- Character start position
+    end_pos INTEGER,    -- Character end position
+    rule_type TEXT      -- e.g., "ghunnah", "idgham_shafawi", "madda_normal"
+);
+```
+
+**Tajweed Rule Types:**
+- `ghunnah`, `idgham_ghunnah`, `idgham_wo_ghunnah`
+- `idgham_shafawi`, `idgham_mutajanisayn`, `idgham_mutaqaribayn`
+- `ikhafa`, `ikhafa_shafawi`, `iqlab`
+- `laam_shamsiyah`, `ham_wasl`
+- `madda_normal`, `madda_necessary`, `madda_obligatory`, `madda_permissible`
+- `qalaqah`, `slnt`
+
+### tajweed_glyphs.db
+```sql
+CREATE TABLE glyphs (
+    page INTEGER,       -- Mushaf page (1-604)
+    surah INTEGER,
+    ayah INTEGER,
+    glyph_text TEXT,    -- Pipe-separated QPC v4 glyph codes
+    PRIMARY KEY (page, surah, ayah)
+);
+```
+
+The `glyph_text` contains pipe-separated (`|`) glyph codes where each segment = one word. Use with QPC v4 fonts.
+
+### mutashabihat.db
+```sql
+CREATE TABLE similarities (
+    id INTEGER PRIMARY KEY,
+    source_ref TEXT,     -- e.g., "2:23:15-17"
+    similar_refs TEXT    -- Semicolon-separated refs
+);
+```
+
+### tafsirs/db/{slug}.db
+```sql
+CREATE TABLE metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT
 );
 
 CREATE TABLE ayahs (
-  id INTEGER PRIMARY KEY, -- 1 to 6236
-  surah_id INTEGER,
-  ayah_number INTEGER,
-  text_uthmani TEXT,
-  FOREIGN KEY(surah_id) REFERENCES surahs(id)
+    surah INTEGER,
+    ayah INTEGER,
+    text TEXT,
+    PRIMARY KEY (surah, ayah)
 );
 ```
 
-### B. `tafsirs.db` (The Massive Archive)
-Contains all 125+ Tafsirs. Large (~1.5GB), streamed on Web, downloaded on demand on Mobile.
+---
 
+## HTTP Range Request Implementation
+
+### Technology Stack
+
+**Web (Browser/PWA):**
+- [`wa-sqlite`](https://github.com/rhashimoto/wa-sqlite) with HTTP VFS
+- Enables querying remote SQLite files without full download
+
+**Mobile (React Native):**
+- [`op-sqlite`](https://github.com/OP-Engineering/op-sqlite) or `react-native-quick-sqlite`
+- Download databases to local storage, query natively
+
+### How It Works
+
+1. SQLite engine requests "Page 42"
+2. VFS driver calculates byte offset: `42 × 4096`
+3. Browser sends: `Range: bytes=172032-176128`
+4. CDN returns just that 4KB chunk
+5. User gets instant query results
+
+### CDN Setup
+
+Host databases on a CDN with CORS and Range Request support:
+
+```
+Base URL: https://cdn.example.com/quran-sql/
+         /db/quran.db
+         /db/info.db
+         /db/tajweed.db
+         /tafsirs/db/{slug}.db
+```
+
+---
+
+## Query Examples
+
+### Get Surah Al-Fatiha
 ```sql
-CREATE TABLE editions (
-  id INTEGER PRIMARY KEY,
-  slug TEXT UNIQUE,       -- e.g., 'en-ibn-kathir'
-  name TEXT,
-  author TEXT,
-  language TEXT,
-  source TEXT,
-  direction TEXT
-);
-
-CREATE TABLE tafsir_content (
-  edition_id INTEGER,
-  surah_id INTEGER,
-  ayah_id INTEGER,
-  text TEXT,              -- The actual HTML/Text content
-  PRIMARY KEY (edition_id, surah_id, ayah_id),
-  FOREIGN KEY (edition_id) REFERENCES editions(id)
-);
-
--- Indexes for speed
-CREATE INDEX idx_tafsir_lookup ON tafsir_content(edition_id, surah_id, ayah_id);
+SELECT * FROM ayahs WHERE surah = 1;
 ```
 
----
-
-## 3. Technology Stack
-
-### Web (Browser / PWA)
-- **Library:** [`wa-sqlite`](https://github.com/rhashimoto/wa-sqlite)
-  - **Why:** Faster than `sql.js`, supports Asyncify, enables VFS.
-- **VFS Driver:** [`wa-sqlite` HTTP VFS](https://github.com/rhashimoto/wa-sqlite/tree/master/src/examples)
-  - **Why:** Allows querying a remote DB file without downloading it.
-- **State Management:** TanStack Query (React Query)
-
-### Mobile (Native)
-- **Library:** [`op-sqlite`](https://github.com/OP-Engineering/op-sqlite) or [`react-native-quick-sqlite`](https://github.com/margelo/react-native-quick-sqlite)
-  - **Why:** Direct C++ bindings to SQLite. 10x faster than standard bridges.
-- **FS Access:** `expo-file-system`
-  - **Why:** Downloading the `.db` files from CDN to local storage.
-
----
-
-## 4. API Endpoints (Static Files)
-
-**Base URL:** `https://cdn.jsdelivr.net/gh/{user}/{repo}@{version}/`
-
-| Resource | Endpoint | Format | Usage |
-| :--- | :--- | :--- | :--- |
-| **Tafsir Index** | `/tafsirs/editions.toon` | JSON/Toon | List available resources |
-| **Per-Edition DB** | `/tafsirs/db/{slug}.db` | SQLite (10-50MB) | Mobile Download & Web Reading |
-| **Master DB** | `/tafsirs/db/master.db` | SQLite (1.5GB) | Web Global Search (Streaming) |
-
----
-
-## 5. Migration Guide (Toon -> SQLite)
-
-### Step 1: Generate Databases
-Run the script `scripts/toon_to_sqlite.py` (to be created):
-1. Iterates through `tafsirs/*.toon`.
-2. Creates a per-edition DB (`tafsirs/db/{id}.db`).
-   - Optimizations: `PRAGMA page_size=4096; VACUUM;`.
-3. Merges all into `tafsirs/db/master.db` (optional).
-
-### Step 2: Optimization for Web Streaming
-To allow "streaming" SQL queries from the web, the DB needs specific optimizations:
+### Get English Translation
 ```sql
-PRAGMA journal_mode = DELETE;
-PRAGMA page_size = 4096;  -- Optimal for HTTP requests
-VACUUM;
+SELECT t.text
+FROM translations t
+JOIN editions e ON t.edition_id = e.id
+WHERE e.slug = 'eng-sahih' AND t.surah = 2 AND t.ayah = 255;
 ```
 
-### Step 3: Web Implementation Strategy
-**"Lazy VFS" Pattern:**
-1. **Default:** Load the specific `edition.db` (~15MB) into IndexedDB (IDB-VFS). This is fast and persistent.
-2. **Search:** Mount the `master.db` (1.5GB) via HTTP-VFS for "Global Search" (search across all tafsirs).
+### Get Tajweed Rules for an Ayah
+```sql
+SELECT start_pos, end_pos, rule_type
+FROM rules
+WHERE surah = 1 AND ayah = 1;
+```
 
-**How HTTP Streaming Works (Magic Byte Ranges):**
-The client developer does **not** calculate ranges manually. The `wa-sqlite` VFS driver handles it:
-1. **SQLite Engine:** Requests "Page 42".
-2. **VFS Driver:** Calculates offset `42 * 4096`.
-3. **Browser:** Sends `Range: bytes=172032-176128`.
-4. **CDN:** Returns just that 4KB chunk.
+### Get Page 1 Glyph Codes
+```sql
+SELECT * FROM glyphs WHERE page = 1;
+```
 
-### Step 4: Mobile Implementation Strategy
-**"Download & Cache" Pattern:**
-1. **Check:** If `local_tafsirs/{id}.db` exists.
-2. **Download:** If not, fetch `https://cdn.../tafsirs/db/{id}.db`.
-3. **Query:** Open via `react-native-quick-sqlite`.
+### Get All Ayahs in Juz 30
+```sql
+SELECT q.surah, q.ayah, q.text
+FROM ayahs q
+JOIN verse_info v ON q.surah = v.surah AND q.ayah = v.ayah
+WHERE v.juz = 30;
+```
 
 ---
 
-## 6. Developer Workflow
-1. **Add new Tafsir:** Add `.toon` file -> Run `toon_to_sqlite.py` -> Upload `.db`.
-2. **Update Metadata:** Edit `editions.toon` -> Re-run script.
+## Conversion Script
+
+To regenerate databases from source `.toon` files:
+
+```bash
+cd /path/to/quran-api-sql
+python3 scripts/convert_all_to_sql.py
+```
+
+This creates all databases in `/db/` with HTTP-optimized settings:
+- `PRAGMA page_size = 4096`
+- `PRAGMA journal_mode = DELETE`
+- `VACUUM` for minimal size
+
+---
+
+## File Size Reference
+
+| Database | Regular Git | Requires |
+|----------|-------------|----------|
+| quran.db | ✅ | - |
+| info.db | ✅ | - |
+| tajweed.db | ✅ | - |
+| tajweed_glyphs.db | ✅ | - |
+| mutashabihat.db | ✅ | - |
+| recitations.db | ✅ | - |
+| editions.db | ❌ | LFS or CDN |
+| tafsirs/db/*.db | ✅* | - |
+| tafsirs/db/master.db | ❌ | LFS or CDN |
+
+*Individual tafsir DBs are under 100MB each
